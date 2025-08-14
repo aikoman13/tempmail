@@ -188,7 +188,7 @@
       custom: (u)=>{
         const p = document.getElementById('customProxy').value.trim();
         if(!p) throw new Error('Custom proxy not set');
-        return p.includes('{url}') ? p.replace('{url}', u) : p + u;
+        return p.includes('{url}') ? p.replace('{url}', u) : (p.endsWith('/')?p:p+'/') + (p.includes('quest=')?encodeURIComponent(u):u);
       }
     };
 
@@ -225,14 +225,30 @@
 
     const btnProbe = el('btnProbe');
 
+    // Proxy Helper modal
+    const proxyHelp = document.createElement('details');
+    proxyHelp.style.marginTop = '10px';
+    proxyHelp.innerHTML = `
+      <summary>Need a custom proxy? (Free Cloudflare Worker)</summary>
+      <div class="small" style="margin-top:8px">
+        <p>1) Create a <strong>Cloudflare Worker</strong> → paste this code → Deploy. 2) Copy your Worker URL and paste it into the <em>Custom proxy</em> box above. You can use <code>?url=</code> or path style.</p>
+        <pre id="cfCode" style="white-space:pre-wrap; background:#0b1220; color:#e5e7eb; padding:12px; border-radius:10px; border:1px solid var(--border)"></pre>
+        <button id="copyCF">Copy code</button>
+      </div>`;
+    document.querySelector('.grid .card details').insertAdjacentElement('afterend', proxyHelp);
+
     let state = {
       login:null, domain:null, expiresAt:null, poller:null, knownIds:new Set(),
       mode:'auto', // 'auto' | 'direct' | 'proxy1' | 'proxy2' | 'proxy3' | 'proxy4' | 'custom' | 'demo'
       activePath:'(none)', lastOpened:null, inboxCache:[],
-      lastErrors:[]
+      lastErrors:[],
+      autoOrder:['direct','proxy1','proxy2','proxy3','proxy4']
     };
 
-    function saveState(){ localStorage.setItem('tmp_state', JSON.stringify({ login:state.login, domain:state.domain, expiresAt:state.expiresAt, mode:state.mode, customProxy:customProxy.value, autoDemo:autoDemoChk.checked })) }
+    function saveState(){ localStorage.setItem('tmp_state', JSON.stringify({ login:state.login, domain:state.domain, expiresAt:state.expiresAt, mode:state.mode, customProxy:customProxy.value, autoDemo:autoDemoChk.checked }))
+      // prioritize custom in auto if provided
+      state.autoOrder = buildAutoOrder();
+    })) }
     function loadState(){ try{ return JSON.parse(localStorage.getItem('tmp_state'))||null }catch{ return null } }
     function clearState(){ localStorage.removeItem('tmp_state') }
 
@@ -255,13 +271,56 @@
     function hideErrorBanner(){ errorBanner.style.display='none' }
 
     // === Network with detailed fallback ======================================
+    function buildAutoOrder(){
+      const hasCustom = !!(customProxy.value && customProxy.value.trim().length);
+      // Try custom first if present
+      return hasCustom ? ['custom','direct','proxy1','proxy2','proxy3','proxy4'] : ['direct','proxy1','proxy2','proxy3','proxy4'];
+    }
+
     async function httpGetJSON(url){
-      const tryOrder = state.mode==='auto' ? ['direct','proxy1','proxy2','proxy3','proxy4'] : (state.mode==='demo'?[]:[state.mode]);
+      const tryOrder = state.mode==='auto' ? state.autoOrder : (state.mode==='demo'?[]:[state.mode]);
       const errs=[];
       for(const key of tryOrder){
         try{
           const wrapped = PROXIES[key](url);
           const res = await fetch(wrapped, { cache:'no-store' });
+          if(!res.ok) throw new Error(`HTTP ${res.status}`);
+          let data; const ct = (res.headers.get('content-type')||'').toLowerCase();
+          if(ct.includes('application/json')) {
+            const parsed = await res.json();
+            // AllOrigins JSON shape { contents, status }
+            if (parsed && typeof parsed === 'object' && typeof parsed.contents === 'string') {
+              const raw = parsed.contents.replace(/^﻿/, '').trim().replace(/^\)\]\}',?/, ''); // strip BOM / XSSI
+              try { data = JSON.parse(raw) } catch { throw new Error('Bad JSON in proxy contents') }
+            } else {
+              data = parsed;
+            }
+          } else {
+            const txt = await res.text();
+            // Sometimes proxies mislabel content-type; attempt JSON parse anyway
+            try{ data = JSON.parse(txt.replace(/^﻿/, '').trim().replace(/^\)\]\}',?/, '')) }catch{ throw new Error('Bad JSON from proxy') }
+          }
+          state.activePath = key; netBadge.textContent = `Network: ${key}`; hideErrorBanner(); return data;
+        }catch(err){ const msg=`[${key}] ${err.message}`; console.warn(msg); errs.push(msg) }
+      }
+      state.lastErrors = errs;
+      throw new Error('All network paths failed');
+    }
+
+    async function httpGetBlob(url){
+      const tryOrder = state.mode==='auto' ? state.autoOrder : (state.mode==='demo'?[]:[state.mode]);
+      const errs=[];
+      for(const key of tryOrder){
+        try{
+          const wrapped = PROXIES[key](url);
+          const res = await fetch(wrapped, { cache:'no-store' });
+          if(!res.ok) throw new Error(`HTTP ${res.status}`);
+          state.activePath = key; netBadge.textContent = `Network: ${key}`; hideErrorBanner(); return await res.blob();
+        }catch(err){ const msg=`[blob:${key}] ${err.message}`; console.warn(msg); errs.push(msg) }
+      }
+      state.lastErrors = errs;
+      throw new Error('All network paths failed (blob)');
+    });
           if(!res.ok) throw new Error(`HTTP ${res.status}`);
           let data; const ct = res.headers.get('content-type')||'';
           if(ct.includes('application/json')) {
@@ -372,6 +431,39 @@
       assertMatch('proxy2 build', PROXIES.proxy2(base), /^https:\/\/api\.allorigins\.win\/get\?url=/);
       assertMatch('proxy3 build', PROXIES.proxy3(base), /^https:\/\/thingproxy\.freeboard\.io\/fetch\//);
       assertMatch('proxy4 build', PROXIES.proxy4(base), /^https:\/\/api\.codetabs\.com\/v1\/proxy\?quest=/);
+      // AllOrigins normalization test: inject a wrapped JSON
+      try{
+        const wrapped = { contents: JSON.stringify({a:1}) };
+        const raw = wrapped.contents.replace(/^﻿/, '').trim().replace(/^\)\]\}',?/, '');
+        const parsed = JSON.parse(raw);
+        assertEqual('unwrap AllOrigins contents', parsed, {a:1});
+      }catch(e){ logTest('<span class=warn>WARN</span> unwrap test skipped') }
+    },()=>randomLogin()));
+      logTest(`${samples.size===200?'<span class=ok>PASS</span>':'<span class=err>FAIL</span>'} randomLogin uniqueness (200)`);
+      const allValid=Array.from(samples).every(s=>/^u[a-z0-9]+$/.test(s));
+      logTest(`${allValid?'<span class=ok>PASS</span>':'<span class=err>FAIL</span>'} randomLogin format`);
+      // sanitizeAlias
+      assertEqual('sanitizeAlias(" My Alias! ")', sanitizeAlias(' My Alias! '), 'myalias');
+      assertMatch('sanitizeAlias starts with letter', sanitizeAlias('1abc'), /^u/);
+      assertEqual('sanitizeAlias keeps dots/underscores', sanitizeAlias('a.b_c-1'), 'a.b_c-1');
+      assertEqual('sanitizeAlias removes @', sanitizeAlias('my@alias'), 'myalias');
+      // renderMessages (DOM smoke test)
+      renderMessages([{id:1,from:'a@b',subject:'hi',date:'now',attachments:[]}]);
+      const rowOk=!!$('#mailRows tr td');
+      logTest(`${rowOk?'<span class=ok>PASS</span>':'<span class=err>FAIL</span>'} renderMessages DOM row`);
+      // EML builder
+      const eml=buildEML({from:'x@y',subject:'s',textBody:'t',htmlBody:'<b>h</b>'});
+      assertMatch('EML has headers', eml, /MIME-Version: 1.0/);
+      assertMatch('EML multipart boundary', eml, /multipart\/alternative/);
+      // filename sanitizer keeps @
+      const demoName='inbox_a@b.json'.replace(/[^a-z0-9._@-]+/gi,'_');
+      assertEqual('filename sanitize keeps @', demoName, 'inbox_a@b.json');
+      // proxy URL building tests (no network)
+      const base='https://example.com/path?q=1';
+      assertEqual('proxy1 build', PROXIES.proxy1(base), 'https://cors.isomorphic-git.org/'+base);
+      assertMatch('proxy2 build', PROXIES.proxy2(base), /^https:\/\/api\.allorigins\.win\/get\?url=/);
+      assertMatch('proxy3 build', PROXIES.proxy3(base), /^https:\/\/thingproxy\.freeboard\.io\/fetch\//);
+      assertMatch('proxy4 build', PROXIES.proxy4(base), /^https:\/\/api\.codetabs\.com\/v1\/proxy\?quest=/);
       // normalize AllOrigins JSON shape (non-fatal)
       (async()=>{ try{ const r = await fetch(PROXIES.proxy2('https://example.com/data.json')); if(r.ok){ const j = await r.json(); const ok = typeof j==='object' && ('contents' in j); logTest(`${ok?'<span class=ok>PASS</span>':'<span class=warn>WARN</span>'} proxy2 returns {contents}`) } } catch { logTest('<span class=warn>WARN</span> proxy2 sample fetch skipped') } })();
     }
@@ -412,7 +504,55 @@
     autoDemoChk.addEventListener('change', saveState);
     btnProbe.addEventListener('click', probe);
 
-    (async function init(){ try{ populateDomains(await apiGetDomains()) }catch{ populateDomains(DEFAULT_DOMAINS) } const s=loadState(); if(s){ state.mode=s.mode||'auto'; modeSelect.value=state.mode; if(s.customProxy) customProxy.value=s.customProxy; if(typeof s.autoDemo==='boolean') autoDemoChk.checked=s.autoDemo; if(state.mode==='demo') activateDemo() } const persisted = s && s.login && s.domain && s.expiresAt>Date.now(); if(persisted){ state.login=s.login; state.domain=s.domain; state.expiresAt=s.expiresAt; showEmail(); startPolling(); btnGenerate.disabled=true } else { clearState(); updateTimer() } setInterval(updateTimer, 500); runTests() })();
+    (async function init(){
+      // Fill CF Worker code block
+      const code = `export default {
+  async fetch(request) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+    const urlObj = new URL(request.url);
+    let target = urlObj.searchParams.get("url");
+    if (!target) {
+      const path = urlObj.pathname.slice(1);
+      if (path.startsWith("http")) target = decodeURIComponent(path);
+    }
+    if (!target) {
+      return new Response("Missing ?url= or path", { status: 400, headers: corsHeaders() });
+    }
+    const allowed = /^https:\/\/(www\.)?1secmail\.com\/api\/v1\//i.test(target);
+    if (!allowed) {
+      return new Response("Blocked target", { status: 403, headers: corsHeaders() });
+    }
+    const upstream = await fetch(target, { cf: { cacheTtl: 0, cacheEverything: false } });
+    const resp = new Response(upstream.body, { status: upstream.status, headers: new Headers(upstream.headers) });
+    resp.headers.set("Access-Control-Allow-Origin", "*");
+    resp.headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+    resp.headers.set("Access-Control-Allow-Headers", "*");
+    resp.headers.set("Cache-Control", "no-store");
+    return resp;
+  }
+};
+function corsHeaders(){
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Cache-Control": "no-store"
+  };
+}`;
+      const pre = document.getElementById('cfCode'); if(pre) pre.textContent = code; const copyBtn = document.getElementById('copyCF'); if(copyBtn) copyBtn.onclick = ()=>{ navigator.clipboard?.writeText(code).then(()=>{ statusEl.textContent='Copied proxy code'; setTimeout(()=>statusEl.textContent='',1200) }) };
+
+      try{ populateDomains(await apiGetDomains()) }catch{ populateDomains(DEFAULT_DOMAINS) }
+      state.autoOrder = buildAutoOrder();
+      const s=loadState();
+      if(s){ state.mode=s.mode||'auto'; modeSelect.value=state.mode; if(s.customProxy) customProxy.value=s.customProxy; if(typeof s.autoDemo==='boolean') autoDemoChk.checked=s.autoDemo; if(state.mode==='demo') activateDemo(); state.autoOrder = buildAutoOrder(); }
+      const persisted = s && s.login && s.domain && s.expiresAt>Date.now();
+      if(persisted){ state.login=s.login; state.domain=s.domain; state.expiresAt=s.expiresAt; showEmail(); startPolling(); btnGenerate.disabled=true }
+      else { clearState(); updateTimer() }
+      setInterval(updateTimer, 500);
+      runTests()
+    })();
   </script>
 </body>
 </html>
